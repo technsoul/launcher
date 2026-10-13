@@ -49,20 +49,52 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
+        if: runner.os != 'Linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (Windows)
+      - name: Package Windows (.exe)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} -DestinationPath dist/techsouls-launcher-${{ matrix.os_name }}.zip
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.bin }} dist/techsouls-launcher-windows.exe
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package Linux (.deb)
+        if: runner.os == 'Linux'
         run: |
+          cargo install cargo-deb --locked
+          cargo deb --locked --target ${{ matrix.target }}
           mkdir -p dist
-          tar -czf dist/techsouls-launcher-${{ matrix.os_name }}.tar.gz -C target/${{ matrix.target }}/release ${{ matrix.bin }}
+          cp target/${{ matrix.target }}/debian/*.deb dist/techsouls-launcher-linux-amd64.deb
+
+      - name: Package macOS (.dmg)
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          APP="dmg/TechSouls Launcher.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} "$APP/Contents/MacOS/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>TechSouls Launcher</string>
+            <key>CFBundleDisplayName</key><string>TechSouls Launcher</string>
+            <key>CFBundleIdentifier</key><string>com.technsoul.launcher</string>
+            <key>CFBundleExecutable</key><string>${{ matrix.bin }}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$APP"
+          ln -s /Applications dmg/Applications
+          mkdir -p dist
+          hdiutil create -volname "TechSouls Launcher" -srcfolder dmg -ov -format UDZO dist/techsouls-launcher-macos.dmg
 
       - uses: actions/upload-artifact@v4
         with:

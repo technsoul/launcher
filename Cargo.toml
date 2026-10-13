@@ -1,7 +1,11 @@
 [package]
 name = "techsouls-launcher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+description = "TechSouls Launcher - install, update and launch TechSouls apps"
+authors = ["TechSouls <krash.abedo@gmail.com>"]
+license = "Proprietary"
+repository = "https://github.com/technsoul/launcher"
 
 [dependencies]
 dirs = "7.0.0"
@@ -20,3 +24,14 @@ lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
+
+[package.metadata.deb]
+name = "techsouls-launcher"
+maintainer = "TechSouls <krash.abedo@gmail.com>"
+section = "games"
+priority = "optional"
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libgl1, libwayland-client0, libx11-6"
+assets = [
+    ["target/release/techsouls-launcher", "usr/bin/", "755"],
+    ["assets/linux/techsouls-launcher.desktop", "usr/share/applications/", "644"],
+]

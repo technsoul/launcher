@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TechSouls Launcher
+Comment=Install, update and launch TechSouls apps
+Exec=techsouls-launcher
+Icon=applications-games
+Terminal=false
+Categories=Game;Utility;
