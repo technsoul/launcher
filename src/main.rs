@@ -1,8 +1,10 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod install;
 mod launcher;
 mod manifest;
+mod selfupdate;
 mod updater;
 
 fn main() -> eframe::Result {

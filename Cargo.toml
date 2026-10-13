@@ -1,6 +1,6 @@
 [package]
 name = "techsouls-launcher"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "TechSouls Launcher - install, update and launch TechSouls apps"
 authors = ["TechSouls <krash.abedo@gmail.com>"]

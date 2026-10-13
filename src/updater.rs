@@ -1,12 +1,14 @@
 //! Installs and updates apps that are published as GitHub Releases.
 //!
 //! Each app lives in `<data dir>/techsouls-launcher/apps/<id>/`:
-//! - `current/`  the extracted release the launcher runs
-//! - `version`   tag of the installed release
+//! - `current/`      the app's files (archives, portable exes, Windows setups)
+//! - `install.json`  where it was installed (see [`Install`]; missing = `current/`)
+//! - `version`       tag of the installed release
 //!
 //! Network and disk work runs on background threads; results come back
 //! through a channel that the UI drains every frame with [`Updater::poll`].
 
+use crate::install::{self, Install, Package};
 use crate::manifest::AppEntry;
 use eframe::egui;
 use serde::Deserialize;
@@ -23,6 +25,7 @@ const USER_AGENT: &str = concat!("techsouls-launcher/", env!("CARGO_PKG_VERSION"
 pub struct Release {
     pub tag: String,
     pub asset_url: String,
+    pub package: Package,
     pub size: u64,
     /// Publish date as `YYYY-MM-DD...` (may be empty).
     pub published: String,
@@ -35,13 +38,24 @@ pub enum State {
     /// A release that is not installed yet (new install or update).
     Available(Release),
     Downloading { done: u64, total: u64 },
+    /// The download is done and the installer is running.
+    Installing,
+    Removing,
     Failed(String),
+}
+
+/// Background work that finished, reported by [`Updater::poll`].
+pub enum Finished {
+    /// Installed or updated, with the new tag.
+    Installed(String, Result<String, String>),
+    Uninstalled(String, Result<(), String>),
 }
 
 enum Event {
     Checked(String, Result<Release, String>),
     Progress(String, u64, u64),
-    Installed(String, Result<String, String>),
+    Installing(String),
+    Done(Finished),
 }
 
 pub struct Updater {
@@ -67,23 +81,27 @@ impl Updater {
         self.latest.get(id)
     }
 
-    /// Removes the installed release of `app` and looks it up again so it
-    /// shows as installable.
+    /// Removes the installed app in the background (running its uninstaller
+    /// or package manager when it has one).
     pub fn uninstall(&mut self, app: &AppEntry) -> Result<(), String> {
         if self.is_busy(&app.id) {
-            return Err("it is busy downloading".into());
+            return Err("it is busy".into());
         }
-        let root = apps_dir().join(&app.id);
-        if root.exists() {
-            fs::remove_dir_all(&root).map_err(|e| format!("{e} (is it still running?)"))?;
-        }
-        self.states.remove(&app.id);
-        self.check(app);
+        self.states.insert(app.id.clone(), State::Removing);
+        let (tx, ctx, id) = (self.tx.clone(), self.ctx.clone(), app.id.clone());
+        thread::spawn(move || {
+            let result = remove(&id);
+            let _ = tx.send(Event::Done(Finished::Uninstalled(id, result)));
+            ctx.request_repaint();
+        });
         Ok(())
     }
 
     pub fn is_busy(&self, id: &str) -> bool {
-        matches!(self.states.get(id), Some(State::Checking | State::Downloading { .. }))
+        matches!(
+            self.states.get(id),
+            Some(State::Checking | State::Downloading { .. } | State::Installing | State::Removing)
+        )
     }
 
     /// Asks GitHub for the latest release of `app`, in the background.
@@ -95,7 +113,7 @@ impl Updater {
         self.states.insert(app.id.clone(), State::Checking);
         let (tx, ctx, id, pattern) = (self.tx.clone(), self.ctx.clone(), app.id.clone(), app.asset.clone());
         thread::spawn(move || {
-            let _ = tx.send(Event::Checked(id, latest_release(&repo, pattern.as_deref())));
+            let _ = tx.send(Event::Checked(id, latest_release(&repo, pattern.as_deref(), Package::preferred())));
             ctx.request_repaint();
         });
     }
@@ -106,21 +124,27 @@ impl Updater {
             return;
         }
         self.states.insert(app.id.clone(), State::Downloading { done: 0, total: release.size });
-        let (tx, ctx, id) = (self.tx.clone(), self.ctx.clone(), app.id.clone());
+        let (tx, ctx, id, target) = (self.tx.clone(), self.ctx.clone(), app.id.clone(), app.target.clone());
         thread::spawn(move || {
-            let progress = |done, total| {
-                let _ = tx.send(Event::Progress(id.clone(), done, total));
+            let send = |event| {
+                let _ = tx.send(event);
                 ctx.request_repaint();
             };
-            let result = download_and_install(&id, &release, progress).map(|()| release.tag.clone());
-            let _ = tx.send(Event::Installed(id.clone(), result));
-            ctx.request_repaint();
+            let result = download_and_install(
+                &id,
+                &target,
+                &release,
+                |done, total| send(Event::Progress(id.clone(), done, total)),
+                || send(Event::Installing(id.clone())),
+            )
+            .map(|()| release.tag.clone());
+            send(Event::Done(Finished::Installed(id.clone(), result)));
         });
     }
 
-    /// Applies finished background work. Returns the ids of apps that were
-    /// installed or updated since the last call, with an error if it failed.
-    pub fn poll(&mut self) -> Vec<(String, Result<String, String>)> {
+    /// Applies finished background work and returns what finished since the
+    /// last call.
+    pub fn poll(&mut self) -> Vec<Finished> {
         let mut finished = vec![];
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -139,13 +163,22 @@ impl Updater {
                 Event::Progress(id, done, total) => {
                     self.states.insert(id, State::Downloading { done, total });
                 }
-                Event::Installed(id, result) => {
-                    let state = match &result {
-                        Ok(_) => State::UpToDate,
-                        Err(e) => State::Failed(e.clone()),
-                    };
-                    self.states.insert(id.clone(), state);
-                    finished.push((id, result));
+                Event::Installing(id) => {
+                    self.states.insert(id, State::Installing);
+                }
+                Event::Done(done) => {
+                    match &done {
+                        Finished::Installed(id, Ok(_)) => {
+                            self.states.insert(id.clone(), State::UpToDate);
+                        }
+                        Finished::Uninstalled(id, Ok(())) => {
+                            self.states.remove(id);
+                        }
+                        Finished::Installed(id, Err(e)) | Finished::Uninstalled(id, Err(e)) => {
+                            self.states.insert(id.clone(), State::Failed(e.clone()));
+                        }
+                    }
+                    finished.push(done);
                 }
             }
         }
@@ -160,18 +193,41 @@ fn apps_dir() -> PathBuf {
         .join("apps")
 }
 
-/// Folder the installed release of `id` runs from.
+/// Folder that holds the app's files, when they are not installed elsewhere.
 pub fn current_dir(id: &str) -> PathBuf {
     apps_dir().join(id).join("current")
 }
 
+/// How `id` is installed, if it is.
+pub fn installation(id: &str) -> Option<Install> {
+    let install = fs::read_to_string(apps_dir().join(id).join("install.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Install::Folder);
+    install.present(&current_dir(id)).then_some(install)
+}
+
+/// Folder to show for an installed app.
+pub fn install_folder(id: &str) -> PathBuf {
+    installation(id).map_or_else(|| current_dir(id), |i| i.folder(&current_dir(id)))
+}
+
 /// Tag of the installed release, if any.
 pub fn installed_version(id: &str) -> Option<String> {
-    if !current_dir(id).is_dir() {
-        return None;
-    }
+    installation(id)?;
     let tag = fs::read_to_string(apps_dir().join(id).join("version")).ok()?;
     Some(tag.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+fn remove(id: &str) -> Result<(), String> {
+    let root = apps_dir().join(id);
+    if let Some(installed) = installation(id) {
+        install::uninstall(&installed, &current_dir(id))?;
+    }
+    if root.exists() {
+        fs::remove_dir_all(&root).map_err(|e| format!("{e} (is it still running?)"))?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -189,7 +245,8 @@ struct GhAsset {
     size: u64,
 }
 
-fn latest_release(repo: &str, pattern: Option<&str>) -> Result<Release, String> {
+/// Latest release of `repo` with a file of one of the `accepted` kinds.
+pub fn latest_release(repo: &str, pattern: Option<&str>, accepted: &[Package]) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let mut response = ureq::get(&url)
         .header("User-Agent", USER_AGENT)
@@ -200,85 +257,78 @@ fn latest_release(repo: &str, pattern: Option<&str>) -> Result<Release, String> 
             e => format!("Update check failed: {e}"),
         })?;
     let release: GhRelease = response.body_mut().read_json().map_err(|e| e.to_string())?;
-    let asset = pick_asset(&release.assets, pattern)
-        .ok_or_else(|| format!("Release {} has no .zip/.tar.gz for this platform", release.tag_name))?;
+    let (asset, package) = pick_asset(&release.assets, pattern, os_name(), accepted)
+        .ok_or_else(|| format!("Release {} has no download for {}", release.tag_name, os_name()))?;
     Ok(Release {
         tag: release.tag_name,
         asset_url: asset.browser_download_url.clone(),
+        package,
         size: asset.size,
         published: release.published_at.unwrap_or_default(),
     })
 }
 
-fn is_archive(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
-}
-
-/// Picks the archive (`.zip` / `.tar.gz`) whose name contains `pattern`
-/// (default: the OS name), falling back to the only archive when there is
-/// exactly one.
-fn pick_asset<'a>(assets: &'a [GhAsset], pattern: Option<&str>) -> Option<&'a GhAsset> {
-    let os = if cfg!(windows) {
+fn os_name() -> &'static str {
+    if cfg!(windows) {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
     } else {
         "linux"
-    };
-    let pattern = pattern.unwrap_or(os).to_lowercase();
-    let archives: Vec<_> = assets.iter().filter(|a| is_archive(&a.name)).collect();
-    archives
-        .iter()
-        .find(|a| a.name.to_lowercase().contains(&pattern))
-        .or_else(|| if archives.len() == 1 { archives.first() } else { None })
-        .copied()
+    }
 }
 
-fn download_and_install(id: &str, release: &Release, progress: impl Fn(u64, u64)) -> Result<(), String> {
+/// Picks the best file for this OS, trying the `accepted` kinds in order.
+/// With a `pattern` the name must contain it. Without one, an archive must
+/// name the OS (or be the only archive), since archives fit any OS.
+fn pick_asset<'a>(
+    assets: &'a [GhAsset],
+    pattern: Option<&str>,
+    os: &str,
+    accepted: &[Package],
+) -> Option<(&'a GhAsset, Package)> {
+    let named = |a: &GhAsset, part: &str| a.name.to_lowercase().contains(&part.to_lowercase());
+    let archives = assets.iter().filter(|a| Package::of(&a.name).is_some_and(Package::is_archive)).count();
+    accepted.iter().find_map(|&kind| {
+        let mut of_kind = assets.iter().filter(|a| Package::of(&a.name) == Some(kind));
+        let asset = match pattern {
+            Some(p) => of_kind.find(|a| named(a, p)),
+            None if kind.is_archive() => {
+                let all: Vec<_> = of_kind.collect();
+                all.iter().find(|a| named(a, os)).or(if archives == 1 { all.first() } else { None }).copied()
+            }
+            None => of_kind.next(),
+        };
+        asset.map(|a| (a, kind))
+    })
+}
+
+fn download_and_install(
+    id: &str,
+    target: &str,
+    release: &Release,
+    progress: impl Fn(u64, u64),
+    installing: impl Fn(),
+) -> Result<(), String> {
     let root = apps_dir().join(id);
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let archive_path = root.join("download");
-    let staging = root.join("staging");
+    let file = root.join(release.package.file_name());
+    download(&release.asset_url, &file, release.size, progress)?;
+
+    installing();
     let current = root.join("current");
-
-    download(&release.asset_url, &archive_path, release.size, progress)?;
-
-    let _ = fs::remove_dir_all(&staging);
-    let file = fs::File::open(&archive_path).map_err(|e| e.to_string())?;
-    if release.asset_url.to_lowercase().ends_with(".zip") {
-        zip::ZipArchive::new(file)
-            .and_then(|mut archive| archive.extract_unwrapped_root_dir(&staging, zip::read::root_dir_common_filter))
-            .map_err(|e| format!("Could not extract update: {e}"))?;
-    } else {
-        extract_tar_gz(file, &staging).map_err(|e| format!("Could not extract update: {e}"))?;
+    let result = install::install(release.package, &file, &current, target);
+    let _ = fs::remove_file(&file);
+    let installed = result?;
+    if installed != Install::Folder {
+        let _ = fs::remove_dir_all(&current);
     }
-    let _ = fs::remove_file(&archive_path);
-
-    if current.exists() {
-        fs::remove_dir_all(&current).map_err(|e| format!("Could not replace old version (is it still running?): {e}"))?;
-    }
-    fs::rename(&staging, &current).map_err(|e| e.to_string())?;
+    let record = serde_json::to_string_pretty(&installed).map_err(|e| e.to_string())?;
+    fs::write(root.join("install.json"), record).map_err(|e| e.to_string())?;
     fs::write(root.join("version"), &release.tag).map_err(|e| e.to_string())
 }
 
-/// Unpacks a `.tar.gz` into `dest`, unwrapping a single top-level folder so
-/// the app's files end up directly in `dest` (like the zip path does).
-fn extract_tar_gz(file: fs::File, dest: &Path) -> std::io::Result<()> {
-    let raw = dest.with_extension("unpack");
-    let _ = fs::remove_dir_all(&raw);
-    tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(&raw)?;
-    let entries: Vec<_> = fs::read_dir(&raw)?.collect::<Result<_, _>>()?;
-    match entries.as_slice() {
-        [only] if only.file_type()?.is_dir() => {
-            fs::rename(only.path(), dest)?;
-            fs::remove_dir(&raw)
-        }
-        _ => fs::rename(&raw, dest),
-    }
-}
-
-fn download(url: &str, dest: &Path, expected: u64, progress: impl Fn(u64, u64)) -> Result<(), String> {
+pub fn download(url: &str, dest: &Path, expected: u64, progress: impl Fn(u64, u64)) -> Result<(), String> {
     let response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .call()
@@ -309,58 +359,47 @@ fn download(url: &str, dest: &Path, expected: u64, progress: impl Fn(u64, u64)) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Package::*;
 
     fn asset(name: &str) -> GhAsset {
         GhAsset { name: name.into(), browser_download_url: format!("https://x/{name}"), size: 1 }
     }
 
+    fn pick<'a>(assets: &'a [GhAsset], pattern: Option<&str>, os: &str, accepted: &[Package]) -> Option<&'a str> {
+        pick_asset(assets, pattern, os, accepted).map(|(a, _)| a.name.as_str())
+    }
+
+    const CATPLAY: [&str; 3] =
+        ["catplay-v0.1.2-windows-x64-setup.exe", "catplay_0.1.2_amd64.deb", "catplay-v0.1.2-macos.dmg"];
+
     #[test]
-    fn picks_asset_matching_pattern() {
+    fn picks_native_package_per_os() {
+        let assets = CATPLAY.map(asset);
+        assert_eq!(pick(&assets, None, "windows", &[Setup, Exe, Zip]), Some(CATPLAY[0]));
+        assert_eq!(pick(&assets, None, "linux", &[Deb, TarGz, Zip]), Some(CATPLAY[1]));
+        assert_eq!(pick(&assets, None, "macos", &[Dmg, Zip, TarGz]), Some(CATPLAY[2]));
+        // A Linux without dpkg can't use any of these.
+        assert_eq!(pick(&assets, None, "linux", &[TarGz, Zip]), None);
+    }
+
+    #[test]
+    fn prefers_native_package_over_archive() {
+        let assets = [asset("cat-windows.zip"), asset("cat-windows-setup.exe")];
+        assert_eq!(pick(&assets, None, "windows", &[Setup, Exe, Zip]), Some("cat-windows-setup.exe"));
+    }
+
+    #[test]
+    fn archives_must_name_the_os_unless_only_one() {
         let assets = [asset("cat-macos.zip"), asset("CAT-Windows-x64.zip"), asset("cat.msix")];
-        assert_eq!(pick_asset(&assets, Some("windows")).unwrap().name, "CAT-Windows-x64.zip");
-        assert_eq!(pick_asset(&assets, Some("macos")).unwrap().name, "cat-macos.zip");
+        assert_eq!(pick(&assets, None, "windows", &[Setup, Exe, Zip]), Some("CAT-Windows-x64.zip"));
+        assert_eq!(pick(&assets, None, "linux", &[Deb, TarGz, Zip]), None);
+        assert_eq!(pick(&[asset("cat.zip")], None, "linux", &[TarGz, Zip]), Some("cat.zip"));
+        assert_eq!(pick(&[], None, "linux", &[TarGz, Zip]), None);
     }
 
     #[test]
-    fn falls_back_to_single_zip() {
-        let assets = [asset("cat.zip"), asset("cat.msix")];
-        assert_eq!(pick_asset(&assets, Some("linux")).unwrap().name, "cat.zip");
-        assert!(pick_asset(&[asset("a.zip"), asset("b.zip")], Some("linux")).is_none());
-        assert!(pick_asset(&[], None).is_none());
-    }
-
-    #[test]
-    fn picks_tar_gz_and_ignores_packages() {
-        let assets = [
-            asset("catplay-v0.1.1-linux-x64.tar.gz"),
-            asset("catplay-v0.1.1-macos.zip"),
-            asset("catplay-v0.1.1-windows-x64.zip"),
-            asset("catplay_0.1.1_amd64.deb"),
-        ];
-        assert_eq!(pick_asset(&assets, Some("linux")).unwrap().name, "catplay-v0.1.1-linux-x64.tar.gz");
-        assert_eq!(pick_asset(&assets, Some("windows")).unwrap().name, "catplay-v0.1.1-windows-x64.zip");
-    }
-
-    #[test]
-    fn tar_gz_unwraps_root_folder() {
-        let tmp = std::env::temp_dir().join(format!("tsl-tar-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        let archive = tmp.join("a.tar.gz");
-        {
-            let gz = flate2::write::GzEncoder::new(fs::File::create(&archive).unwrap(), Default::default());
-            let mut builder = tar::Builder::new(gz);
-            let data = b"bin";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder.append_data(&mut header, "app-1.0/catplay", &data[..]).unwrap();
-            builder.into_inner().unwrap().finish().unwrap();
-        }
-        let dest = tmp.join("staging");
-        extract_tar_gz(fs::File::open(&archive).unwrap(), &dest).unwrap();
-        assert_eq!(fs::read(dest.join("catplay")).unwrap(), b"bin");
-        let _ = fs::remove_dir_all(&tmp);
+    fn pattern_overrides_os_name() {
+        let assets = [asset("cat-x64.zip"), asset("cat-arm64.zip")];
+        assert_eq!(pick(&assets, Some("ARM64"), "linux", &[TarGz, Zip]), Some("cat-arm64.zip"));
     }
 }

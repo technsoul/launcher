@@ -1,5 +1,7 @@
 use crate::manifest::{self, AppEntry, LaunchKind, Manifest};
-use crate::updater::{self, Release, State, Updater};
+use crate::install::Install;
+use crate::selfupdate::{self, SelfUpdater};
+use crate::updater::{self, Finished, Release, State, Updater};
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Galley, Id, Painter, Pos2, Rect,
@@ -89,6 +91,8 @@ enum Phase {
     Install(Release),
     Checking,
     Downloading(Option<f32>),
+    /// Installing or removing; the label says which.
+    Busy(&'static str),
     Unavailable(String),
 }
 
@@ -122,7 +126,7 @@ impl Row {
         match self.phase {
             Phase::Update(_) => 0,
             Phase::Ready => 1,
-            Phase::Downloading(_) => 2,
+            Phase::Downloading(_) | Phase::Busy(_) => 2,
             Phase::Install(_) => 3,
             Phase::Checking => 4,
             Phase::Unavailable(_) => 5,
@@ -141,6 +145,7 @@ impl Row {
             Phase::Install(_) => ("AVAILABLE TO INSTALL".to_string(), BLUE),
             Phase::Checking => ("CHECKING".to_string(), MUTED),
             Phase::Downloading(_) => ("DOWNLOADING".to_string(), BLUE),
+            Phase::Busy(label) => (label.to_string(), BLUE),
             Phase::Unavailable(_) => ("UNAVAILABLE".to_string(), RED),
         };
         if self.running > 0 { (format!("{text} · RUNNING"), color) } else { (text, color) }
@@ -168,6 +173,7 @@ impl Row {
             Phase::Checking => ("CHECKING…".into(), false, false, None),
             Phase::Downloading(Some(p)) => (format!("DOWNLOADING {}%", (p * 100.0) as u32), false, false, Some(*p)),
             Phase::Downloading(None) => ("DOWNLOADING…".into(), false, false, None),
+            Phase::Busy(label) => (format!("{label}…"), false, false, None),
             Phase::Unavailable(_) => ("RETRY".into(), false, true, None),
         }
     }
@@ -178,7 +184,7 @@ impl Row {
             Phase::Ready => Some(Cmd::Open(app)),
             Phase::Update(r) | Phase::Install(r) => Some(Cmd::Install(app, r.clone())),
             Phase::Unavailable(_) => Some(Cmd::Check(app)),
-            Phase::Checking | Phase::Downloading(_) => None,
+            Phase::Checking | Phase::Downloading(_) | Phase::Busy(_) => None,
         }
     }
 
@@ -199,6 +205,8 @@ enum Cmd {
     Reveal(PathBuf),
     Url(String),
     Reload,
+    UpdateLauncher,
+    RestartLauncher,
 }
 
 pub struct Launcher {
@@ -212,6 +220,7 @@ pub struct Launcher {
     running: HashMap<String, Vec<Child>>,
     status: Option<(String, bool)>,
     updater: Updater,
+    selfupdate: SelfUpdater,
     last_check: Instant,
     /// Apps to launch as soon as their install/update finishes.
     launch_after_install: HashSet<String>,
@@ -232,6 +241,7 @@ impl Launcher {
             running: HashMap::new(),
             status: None,
             updater: Updater::new(cc.egui_ctx.clone()),
+            selfupdate: SelfUpdater::new(cc.egui_ctx.clone()),
             last_check: Instant::now(),
             launch_after_install: HashSet::new(),
         };
@@ -252,6 +262,7 @@ impl Launcher {
 
     fn check_updates(&mut self) {
         self.last_check = Instant::now();
+        self.selfupdate.check();
         for app in &self.manifest.apps {
             self.updater.check(app);
         }
@@ -260,15 +271,29 @@ impl Launcher {
     /// Handles finished installs, starts updates for apps that are idle and
     /// launches apps the user clicked once they are ready.
     fn drive_updates(&mut self) {
-        for (id, result) in self.updater.poll() {
+        if let Some(result) = self.selfupdate.poll() {
+            self.status = Some(match result {
+                Ok(msg) => (msg, false),
+                Err(e) => (e, true),
+            });
+        }
+        for finished in self.updater.poll() {
+            let id = match &finished {
+                Finished::Installed(id, _) | Finished::Uninstalled(id, _) => id.clone(),
+            };
             let Some(app) = self.manifest.apps.iter().find(|a| a.id == id).cloned() else { continue };
-            match result {
-                Ok(tag) => self.status = Some((format!("{} updated to {tag}", app.name), false)),
-                Err(e) => {
+            self.status = Some(match finished {
+                Finished::Installed(_, Ok(tag)) => (format!("{} updated to {tag}", app.name), false),
+                Finished::Installed(_, Err(e)) => {
                     self.launch_after_install.remove(&id);
-                    self.status = Some((format!("Could not update {}: {e}", app.name), true));
+                    (format!("Could not update {}: {e}", app.name), true)
                 }
-            }
+                Finished::Uninstalled(_, Ok(())) => {
+                    self.updater.check(&app);
+                    (format!("{} was uninstalled", app.name), false)
+                }
+                Finished::Uninstalled(_, Err(e)) => (format!("Could not uninstall {}: {e}", app.name), true),
+            });
         }
 
         // Update installed apps automatically, but never while they run.
@@ -313,6 +338,8 @@ impl Launcher {
             Some(State::Downloading { done, total }) => {
                 Phase::Downloading((*total > 0).then(|| *done as f32 / *total as f32))
             }
+            Some(State::Installing) => Phase::Busy("INSTALLING"),
+            Some(State::Removing) => Phase::Busy("REMOVING"),
             Some(State::Available(r)) if installed => Phase::Update(r.clone()),
             Some(State::Available(r)) => Phase::Install(r.clone()),
             _ if installed => Phase::Ready,
@@ -384,7 +411,9 @@ impl Launcher {
             false
         };
         match self.updater.state(&app.id).cloned() {
-            Some(State::Downloading { .. }) => wait(self, format!("{} will start when the download finishes", app.name)),
+            Some(State::Downloading { .. } | State::Installing) => {
+                wait(self, format!("{} will start when the install finishes", app.name))
+            }
             Some(State::Available(release)) if !installed || self.running_count(&app.id) == 0 => {
                 self.updater.install(app, release);
                 wait(self, format!("Downloading {}…", app.name))
@@ -413,7 +442,7 @@ impl Launcher {
             Cmd::Check(app) => self.updater.check(&app),
             Cmd::Uninstall(app) => {
                 self.status = Some(match self.updater.uninstall(&app) {
-                    Ok(()) => (format!("{} was uninstalled", app.name), false),
+                    Ok(()) => (format!("Removing {}…", app.name), false),
                     Err(e) => (format!("Could not uninstall {}: {e}", app.name), true),
                 });
             }
@@ -424,6 +453,11 @@ impl Launcher {
                 let _ = open::that_detached(url);
             }
             Cmd::Reload => self.reload(),
+            Cmd::UpdateLauncher => {
+                self.status = Some(("Updating TechSouls Launcher…".into(), false));
+                self.selfupdate.update();
+            }
+            Cmd::RestartLauncher => self.selfupdate.restart(),
         }
     }
 
@@ -596,7 +630,26 @@ impl Launcher {
                 p.galley(Pos2::new(right, cy - g.size().y / 2.0), g, FAINT);
                 right -= 28.0;
                 right = link(ui, Pos2::new(right, cy), "GITHUB", Id::new("footer-gh"), COMPANY_GITHUB, cmds) - 18.0;
-                let links_left = link(ui, Pos2::new(right, cy), "TECHSOULS.TECH", Id::new("footer-site"), COMPANY_SITE, cmds);
+                let mut links_left = link(ui, Pos2::new(right, cy), "TECHSOULS.TECH", Id::new("footer-site"), COMPANY_SITE, cmds);
+
+                // Launcher self-update: needs a click to start (Linux) or to restart.
+                let action = match &self.selfupdate.state {
+                    selfupdate::State::Available(r) => Some((format!("UPDATE LAUNCHER TO {}", r.tag), Cmd::UpdateLauncher)),
+                    selfupdate::State::Ready(tag) => Some((format!("RESTART TO USE {tag}"), Cmd::RestartLauncher)),
+                    _ => None,
+                };
+                if let Some((label, cmd)) = action {
+                    let g = galley(ui, label, mono(10.5), Color32::PLACEHOLDER, 1.8);
+                    let size = g.size() + Vec2::new(16.0, 8.0);
+                    let rect = Rect::from_min_size(Pos2::new(links_left - 28.0 - size.x, cy - size.y / 2.0), size);
+                    let r = hit(ui, rect, Id::new("footer-selfupdate"));
+                    p.rect_filled(rect, 0, if r.hovered() { TEXT } else { BRAND });
+                    p.galley(rect.center() - g.size() / 2.0, g, BAR);
+                    if r.clicked() {
+                        cmds.push(cmd);
+                    }
+                    links_left = rect.left();
+                }
 
                 let max_width = (links_left - bar.left() - 60.0).max(40.0);
                 let (text, font, color, spacing) = match &self.status {
@@ -898,7 +951,7 @@ fn action_buttons(ui: &mut egui::Ui, main: Rect, menu: Rect, row: &Row, id: Id, 
             }
             if row.installed {
                 if ui.button("Show install folder").clicked() {
-                    cmds.push(Cmd::Reveal(updater::current_dir(&app.id)));
+                    cmds.push(Cmd::Reveal(updater::install_folder(&app.id)));
                 }
                 let uninstall = ui
                     .add_enabled(row.running == 0, egui::Button::new("Uninstall"))
@@ -1089,6 +1142,19 @@ fn window_frame(ui: &egui::Ui) {
 fn exe_command(app: &AppEntry) -> Command {
     if app.github.is_none() {
         return Command::new(&app.target);
+    }
+    match updater::installation(&app.id) {
+        Some(Install::Deb { exe, .. }) => return Command::new(exe),
+        Some(Install::App { path }) => {
+            // `-W` keeps `open` alive while the app runs, so it shows as running.
+            let mut cmd = Command::new("open");
+            cmd.args(["-W", "-n"]).arg(path);
+            if !app.args.is_empty() {
+                cmd.arg("--args");
+            }
+            return cmd;
+        }
+        _ => {}
     }
     let dir = updater::current_dir(&app.id);
     let exe = dir.join(&app.target);
