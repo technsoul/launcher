@@ -1,0 +1,22 @@
+[package]
+name = "techsouls-launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["svg", "file"] }
+flate2 = "1.1.10"
+open = "5.4.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tar = "0.4.46"
+ureq = { version = "3", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
