@@ -149,7 +149,7 @@ fn builtin() -> Manifest {
                 name: "Yarita".into(),
                 description: "Pomodoro timer that blocks distractions".into(),
                 category: "Productivity".into(),
-                target: if cfg!(windows) { "focus-ui.exe" } else { "focus-ui" }.into(),
+                target: if cfg!(windows) { "yarita.exe" } else { "yarita" }.into(),
                 args: vec![],
                 kind: LaunchKind::Exe,
                 color: Some("#000000".into()),
