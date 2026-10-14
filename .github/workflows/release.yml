@@ -30,6 +30,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: techsouls-launcher
     runs-on: ${{ matrix.os }}
+    env:
+      SIGN_WINDOWS: ${{ secrets.AZURE_CLIENT_ID != '' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,12 +54,67 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # The plain exe is what the launcher downloads to update itself.
       - name: Package Windows (.exe)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/${{ matrix.target }}/release/${{ matrix.bin }} dist/techsouls-launcher-windows.exe
+
+      # Signing is what stops the SmartScreen "Windows protected your PC"
+      # warning. It runs only once the Azure Trusted Signing secrets are set.
+      - name: Sign launcher (.exe)
+        if: runner.os == 'Windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The setup exe is what people download to install it.
+      - name: Build Windows installer (setup .exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          New-Item -ItemType Directory -Force setup | Out-Null
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$version" "/DSourceExe=$((Resolve-Path dist/techsouls-launcher-windows.exe).Path)" "/O$((Resolve-Path setup).Path)" installer/windows/techsouls-launcher.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Sign installer (setup .exe)
+        if: runner.os == 'Windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: setup
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Collect Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Move-Item setup/*.exe dist/
 
       - name: Package Linux (.deb)
         if: runner.os == 'Linux'

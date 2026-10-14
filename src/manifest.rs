@@ -77,7 +77,10 @@ pub fn manifest_path() -> PathBuf {
 }
 
 /// Icons shipped inside the launcher, written to `<config>/icons/`.
-const BUNDLED_ICONS: &[(&str, &[u8])] = &[("catplay.svg", include_bytes!("../assets/icons/catplay.svg"))];
+const BUNDLED_ICONS: &[(&str, &[u8])] = &[
+    ("catplay.svg", include_bytes!("../assets/icons/catplay.svg")),
+    ("yarita.svg", include_bytes!("../assets/icons/yarita.svg")),
+];
 
 /// Resolves an app's `icon` to a path on disk.
 pub fn icon_path(icon: &str) -> PathBuf {
@@ -142,6 +145,20 @@ fn builtin() -> Manifest {
                 website: None,
             },
             AppEntry {
+                id: "yarita".into(),
+                name: "Yarita".into(),
+                description: "Pomodoro timer that blocks distractions".into(),
+                category: "Productivity".into(),
+                target: if cfg!(windows) { "focus-ui.exe" } else { "focus-ui" }.into(),
+                args: vec![],
+                kind: LaunchKind::Exe,
+                color: Some("#000000".into()),
+                icon: Some("icons/yarita.svg".into()),
+                github: Some("technsoul/yarita".into()),
+                asset: None,
+                website: None,
+            },
+            AppEntry {
                 id: "website".into(),
                 name: "TechSouls Website".into(),
                 description: "www.techsouls.tech".into(),
@@ -178,6 +195,6 @@ mod tests {
         user.apps.push(extra);
 
         let merged = merge(builtin(), user);
-        assert_eq!(names(&merged), ["CAT Beta", "TechSouls Website", "Extra"]);
+        assert_eq!(names(&merged), ["CAT Beta", "Yarita", "TechSouls Website", "Extra"]);
     }
 }
