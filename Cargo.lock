@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "techsouls-launcher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dirs",
  "eframe",
