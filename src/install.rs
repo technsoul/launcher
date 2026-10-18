@@ -263,18 +263,32 @@ fn deb_program(package: &str, target: &str) -> Result<PathBuf, String> {
 
 /// Runs a command as root through pkexec, which shows the password dialog.
 fn privileged(args: &[&str]) -> Result<(), String> {
-    let status = Command::new("pkexec")
+    let out = Command::new("pkexec")
         .arg("env")
         .arg("DEBIAN_FRONTEND=noninteractive")
         .args(args)
         .stdin(Stdio::null())
-        .status()
+        .output()
         .map_err(|_| "Installing needs administrator rights, but pkexec is not available".to_string())?;
-    match status.code() {
+    match out.status.code() {
         Some(0) => Ok(()),
         Some(126 | 127) => Err("The administrator password was not given".into()),
-        code => Err(format!("{} failed (exit code {})", args.join(" "), code.unwrap_or(-1))),
+        code => {
+            let reason = failure_reason(&String::from_utf8_lossy(&out.stderr));
+            Err(format!("{} failed (exit code {}){reason}", args[0], code.unwrap_or(-1)))
+        }
     }
+}
+
+/// The lines of apt/dpkg output that say why it failed, e.g. an unmet
+/// dependency, as `: ...` (empty when there are none).
+fn failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("Depends:") || l.starts_with("E:") || l.starts_with("dpkg: error"))
+        .collect();
+    if lines.is_empty() { String::new() } else { format!(": {}", lines.join(" ")) }
 }
 
 fn output<I, S>(program: &str, args: I) -> Result<String, String>
@@ -365,6 +379,19 @@ mod tests {
         assert_eq!(Package::of("CAT-macos.DMG"), Some(Package::Dmg));
         assert_eq!(Package::of("a.tgz"), Some(Package::TarGz));
         assert_eq!(Package::of("cat.msix"), None);
+    }
+
+    #[test]
+    fn explains_apt_failures() {
+        let apt = "WARNING: apt does not have a stable CLI interface.\n\
+                   The following packages have unmet dependencies:\n \
+                   catplay : Depends: libmpv1 but it is not installable\n\
+                   E: Unable to correct problems, you have held broken packages.\n";
+        assert_eq!(
+            failure_reason(apt),
+            ": catplay : Depends: libmpv1 but it is not installable E: Unable to correct problems, you have held broken packages."
+        );
+        assert_eq!(failure_reason("something else\n"), "");
     }
 
     #[test]
